@@ -49,18 +49,18 @@ Graph-structured data is increasingly used to model complex relationships in soc
   ┌─────────────────────────────────────────────────────────────┐
   │                      AWS EC2 Instance                       │
   │                                                             │
-  │  ┌─────────────────┐   encrypted      ┌─────────────────┐  │
+  │  ┌─────────────────┐   encrypted      ┌─────────────────┐   │
   │  │   Flask App      │ ───────────────► │  Neo4j (local)  │  │
   │  │  TeeDemo.py      │ ◄─────────────── │  Graph Store    │  │
   │  └────────┬─────────┘  ciphertext only └─────────────────┘  │
-  │           │ AF_VSOCK                                         │
+  │           │ AF_VSOCK                                        │
   │  ┌────────▼─────────┐   ┌─────────────────────────────────┐ │
   │  │  Nitro Enclave   │   │      Apache Spark Cluster       │ │
   │  │  (TEE)           │◄──│  k executor-enclave pairs       │ │
   │  │  - AES decrypt   │   │  dynamic k based on workload r  │ │
   │  │  - DSSE lookup   │   └─────────────────────────────────┘ │
-  │  │  - ORAM control  │                                        │
-  │  └──────────────────┘                                        │
+  │  │  - ORAM control  │                                       │
+  │  └──────────────────┘                                       │
   └─────────────────────────────────────────────────────────────┘
 ```
 
