@@ -1,6 +1,5 @@
 # DVH-GQP: Dynamic Volume-Hiding Framework for Secure Graph Query Processing
 
-> **Jamevit Thitiphatorn, Thanthiphanan Kajornkovit, Thanapon Kwantiptanasan, Jiratchaya Nithichotiyanan, Somchart Fugkeaw**
 > Sirindhorn International Institute of Technology, Thammasat University, Thailand
 
 A privacy-preserving graph query system that encrypts graph data using **AES-256-GCM**, stores it in **Neo4j**, and supports secure queries via a **DSSE label index**, **Selective ORAM-padded** BFS traversal, and subgraph matching — all executed inside **AWS Nitro Enclaves (TEE)** with **Apache Spark** distributed processing.
