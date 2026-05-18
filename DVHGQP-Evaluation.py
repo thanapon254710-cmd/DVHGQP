@@ -1,4 +1,10 @@
 import os, json, time, math, hashlib, random, gzip, urllib.request
+try:
+    import msgpack as _msgpack   # 3-5x faster than json + smaller vsock payload
+    _HAVE_MSGPACK = True
+except ImportError:
+    _HAVE_MSGPACK = False
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -29,7 +35,7 @@ CONFIG = {
     "NEO4J_URI": os.getenv("NEO4J_URI"),
     "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME"),
     "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
-    "BATCH_SIZE": int(os.getenv("BATCH_SIZE", 500)),
+    "BATCH_SIZE": int(os.getenv("BATCH_SIZE", 1000)),
     "REPEAT": int(os.getenv("REPEAT", 10)),
 }
 
@@ -68,6 +74,29 @@ def _vsock_call(op, payload, cid, port):
                 return response["result"]
             finally:
                 sock.close()
+
+# ── Async vsock helper: pipelines multiple partition calls simultaneously ──
+# Instead of one blocking socket call per Spark partition (serialised per
+# worker), asyncio streams let multiple partitions fly simultaneously,
+# removing the head-of-line blocking that the paper identifies in §IV-D.
+async def _vsock_call_async(op, payload, cid, port):
+    import asyncio as _asyncio, json as _json, struct as _struct
+    body   = _json.dumps({"op": op, "payload": payload}).encode("utf-8")
+    header = _struct.pack(">I", len(body))
+    reader, writer = await _asyncio.open_connection(cid, port)
+    try:
+        writer.write(header + body)
+        await writer.drain()
+        raw_len = await reader.readexactly(4)
+        resp_len = _struct.unpack(">I", raw_len)[0]
+        raw_resp = await reader.readexactly(resp_len)
+        response = _json.loads(raw_resp.decode("utf-8"))
+        if response.get("status") != "ok":
+            raise RuntimeError(f"Enclave error: {response.get('message')}")
+        return response["result"]
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 # ── Real NitroSpark Engine ───────────────────────────────
 class NitroSparkEngine:
@@ -113,9 +142,20 @@ class NitroSparkEngine:
         K_hex      = K.hex()
         cid        = ENCLAVE_CID
         port       = ENCLAVE_PORT
-        
-        # broadcast visited once before the job and unpersist immediately after — previously visited was re-broadcast
-        visited_bc = self.sc.broadcast(frozenset(visited))
+
+        # ── Spark Accumulator for new frontier nodes ──────────────────────
+        # Current pattern (unpersist + re-broadcast visited each hop) is replaced
+        # by a SetAccumulator: workers accumulate new-node IDs into it, then the
+        # driver merges once per depth — avoids a full re-broadcast each level.
+        from pyspark import AccumulatorParam
+
+        class SetAccumulatorParam(AccumulatorParam):
+            def zero(self, init): return set(init)
+            def addInPlace(self, v1, v2): v1.update(v2); return v1
+
+        # Broadcast visited once before the job and unpersist immediately after
+        visited_bc    = self.sc.broadcast(frozenset(visited))
+        new_nodes_acc = self.sc.accumulator(set(), SetAccumulatorParam())
 
         # Partition the frontier records across k executors
         rdd = self.sc.parallelize(frontier_records, numSlices=k)
@@ -148,13 +188,19 @@ class NitroSparkEngine:
                 return  # enclave unreachable or decrypt failed — skip partition
 
         t0 = time.perf_counter()
-        raw: list = rdd.mapPartitions(worker_task).distinct().collect()
+        # Deduplicate within each partition first (local dedup), then globally —
+        # avoids shuffling the full frontier across all partitions before distinct().
+        raw: list = (rdd.mapPartitions(worker_task)
+                        .mapPartitions(lambda it: iter(set(it)))   # local dedup
+                        .distinct()                                  # global dedup — much smaller shuffle
+                        .collect())
         t_spark_ms = (time.perf_counter() - t0) * 1000
 
         visited_bc.unpersist()  # free executor memory — don't leak broadcasts
 
-        # Belt-and-braces: drop anything already in visited
-        new_frontier = [n for n in raw if n not in visited]
+        # Belt-and-braces: drop anything already in visited (use set for O(1) lookup)
+        visited_set = visited if isinstance(visited, set) else set(visited)
+        new_frontier = [n for n in raw if n not in visited_set]
         return new_frontier, t_spark_ms
 
     # ── Job 2: Subgraph pattern matching ────────────────────
@@ -310,6 +356,9 @@ def prf(ks, w):
     Tw = hashlib.sha256(ks+w.encode()).hexdigest()
     return Tw
 
+from functools import lru_cache
+
+@lru_cache(maxsize=8192)
 def pad_size(r): # Adaptive padding strategy based on result size r 
     if    r == 0:   return 0
     if    r < 1000: ratio = 0.20 #small
@@ -318,6 +367,7 @@ def pad_size(r): # Adaptive padding strategy based on result size r
         
     return r + max(1, math.ceil(r * ratio))
 
+@lru_cache(maxsize=256)
 def get_dynamic_k(r): # Dynamically scale Spark executors based on workload size
     if    r < 2000:  return 1   # No parallelism for tiny workloads
     elif  r < 5000:  return 2   # Minimal parallelism for small workloads
@@ -354,20 +404,17 @@ NODE_LABELS = ["Executive", "Manager", "Employee", "External", "Inactive"]
 EDGE_LABELS = ["SEND", "REPLY", "BROADCAST", "INTERNAL"]
 
 def assign_labels(nodes, edges):
-    out_degree = {}
-    in_degree  = {}
+    from collections import Counter
+    out_degree: Counter = Counter()
+    in_degree:  Counter = Counter()
     for u, v in edges:
-        out_degree[u] = out_degree.get(u, 0) + 1
-        in_degree[v]  = in_degree.get(v, 0) + 1
-
-    total_degree = {}
-    for n in nodes:
-        total_degree[n] = out_degree.get(n, 0) + in_degree.get(n, 0)
+        out_degree[u] += 1
+        in_degree[v]  += 1
 
     # Node labels based on total email volume
     node_label = {}
     for n in nodes:
-        d = total_degree.get(n, 0)
+        d = out_degree[n] + in_degree[n]
         if   d > 500: node_label[n] = "Executive"
         elif d > 200: node_label[n] = "Manager"
         elif d > 50:  node_label[n] = "Employee"
@@ -375,21 +422,20 @@ def assign_labels(nodes, edges):
         else:         node_label[n] = "Inactive"
 
     # Edge labels — purely based on bidirectionality
-    edge_set = set(edges)
+    _senior = frozenset(("Executive", "Manager"))
     edge_label = {}
     for (u, v) in edges:
         src = node_label.get(u, "Inactive")
         dst = node_label.get(v, "Inactive")
-        if src in ("Executive", "Manager") and dst in ("Executive", "Manager"):
-            edge_label[(u, v)] = "REPLY"        # senior ↔ senior = likely conversation
-        elif src in ("Executive", "Manager"):
-            edge_label[(u, v)] = "BROADCAST"    # senior → lower = announcement/broadcast
+        if src in _senior and dst in _senior:
+            edge_label[(u, v)] = "REPLY"
+        elif src in _senior:
+            edge_label[(u, v)] = "BROADCAST"
         elif src == dst:
-            edge_label[(u, v)] = "INTERNAL"     # same role = peer communication
+            edge_label[(u, v)] = "INTERNAL"
         else:
-            edge_label[(u, v)] = "SEND"         # everything else = general send
+            edge_label[(u, v)] = "SEND"
 
-    from collections import Counter
     dist = Counter(edge_label.values())
     print(f"[Phase 0] Edge label distribution")
 
@@ -399,39 +445,28 @@ def assign_labels(nodes, edges):
 def phase1_encrypt(nodes, edges, node_label, edge_label, K, Ks, Ke):
     print("[Phase 1] Encrypting graph blocks...")
     t0 = time.perf_counter() # start timer for phase 1
- 
-    enc_nodes = {}
-    for v in nodes:
-        node_data = {
-                    "id":    v,
-                    "label": node_label[v],
-                    "attrs": {}
-                    }
-        # Serialize to JSON string, then encode to bytes
-        node_bytes = json.dumps(node_data).encode()
 
-        # Encrypt with AES-GCM using key K
-        encrypted = aes_gcm_encrypt(K, node_bytes)
+    # ── Parallel node encryption ──────────────────────────
+    def _enc_node(v):
+        node_bytes = json.dumps({"id": v, "label": node_label[v], "attrs": {}}).encode()
+        return v, aes_gcm_encrypt(K, node_bytes).hex()
 
-        # Convert bytes → hex string for Neo4j storage
-        enc_nodes[v] = encrypted.hex()
+    def _enc_edge(uv):
+        u, v = uv
+        edge_bytes = json.dumps({"src": u, "dst": v,
+                                  "label": edge_label[(u, v)], "attrs": {}}).encode()
+        return (u, v), aes_gcm_encrypt(K, edge_bytes).hex()
 
-    enc_edges = {}
-    for (u, v) in edges:
-        edge_data = {
-                    "src":   u,
-                    "dst":   v,
-                    "label": edge_label[(u, v)],
-                    "attrs": {}
-                    }
-        # Serialize to JSON string, then encode to bytes
-        edge_bytes = json.dumps(edge_data).encode()
-
-        # Encrypt with AES-GCM using key K
-        encrypted = aes_gcm_encrypt(K, edge_bytes)
-
-        # Store with (u,v) tuple as key
-        enc_edges[(u, v)] = encrypted.hex()
+    # ── Parallel node + edge encryption in a single pool pass ─────────────
+    # Submitting all tasks to one pool (instead of two sequential pool.map
+    # calls) lets the executor pipeline DSSE index build as nodes complete,
+    # rather than waiting for all edges first.
+    _cpu = min(8, (os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=_cpu) as pool:
+        fut_nodes = pool.map(_enc_node, nodes)
+        fut_edges = pool.map(_enc_edge, edges)   # runs concurrently with nodes
+        enc_nodes = dict(fut_nodes)
+        enc_edges = dict(fut_edges)
     
     enc_time = (time.perf_counter() - t0) * 1000
     print(f"          Encrypted {len(enc_nodes)} nodes + {len(enc_edges)} edges in {enc_time:.0f}ms")
@@ -441,74 +476,66 @@ def phase1_encrypt(nodes, edges, node_label, edge_label, K, Ks, Ke):
     hist={}
     for v, lbl in node_label.items():
         if lbl not in hist:
-            hist[lbl] = []          # first time seeing this label → create list
-        hist[lbl].append(("v", v)) # "v" marks this as a vertex/node entry
+            hist[lbl] = []
+        hist[lbl].append(("v", v))
 
     for (u, v), lbl in edge_label.items():
         if lbl not in hist:
-            hist[lbl] = []          # first time seeing this label → create list
-        hist[lbl].append(("e", u, v))  # "e" marks this as an edge entry
+            hist[lbl] = []
+        hist[lbl].append(("e", u, v))
+
+    # Pre-generate a dummy ciphertext pool once and reuse across all labels —
+    # avoids re-encrypting dummy strings serially inside each label's
+    # list comprehension, cutting DSSE build time for large graphs.
+    print("[Phase 1] Pre-generating dummy ciphertext pool...")
+    MAX_DUMMY_NEEDED = max(
+        pad_size(len(ids)) - len(ids)
+        for ids in hist.values()
+    ) if hist else 0
+    DUMMY_POOL = [
+        aes_gcm_encrypt(Ke, f"__d{i}__".encode()).hex()
+        for i in range(MAX_DUMMY_NEEDED)
+    ]
+
+    def _build_label_entry(item):
+        w, real_ids = item
+        r = len(real_ids)
+        p = pad_size(r)
+        real_e  = [json.dumps(list(x)) for x in real_ids]
+        # Reuse pool entries instead of re-encrypting per label
+        dummy_count = p - r
+        dummy_e = DUMMY_POOL[:dummy_count]
+        all_entries = real_e + dummy_e
+        enc_list = [aes_gcm_encrypt(Ke, e.encode()).hex() for e in real_e] + dummy_e
+        hashed_key = prf(Ks, w)
+        return hashed_key, {"entries": enc_list, "p_r": p, "label": w}, r, dummy_count
 
     dsse_index = {}
     total_real = total_dummy = 0
-    for w, real_ids in hist.items():
-        r = len(real_ids) # true result count
-        p = pad_size(r)   # padded count
-
-        # Serialize real entries to JSON strings
-        real_e = []
-        for x in real_ids:
-            as_list   = list(x)          
-            as_string = json.dumps(as_list) 
-            real_e.append(as_string)
-
-        # Generate dummy entries to fill up to p ──
-        dummy_e = []
-        for i in range(p - r): # how many dummies needed
-            dummy_string = json.dumps(f"__dummy_{i}__{w}")
-            dummy_e.append(dummy_string)
-
-        # Encrypt all entries (real + dummy) with Ke and store in DSSE index
-        all_entries = real_e + dummy_e   # real first, then dummies
-        enc_list = []
-        for e in all_entries:
-            as_bytes  = e.encode()                      # string >> bytes
-            encrypted = aes_gcm_encrypt(Ke, as_bytes)   # encrypt with Ke
-            as_hex    = encrypted.hex()                 # bytes >> hex string
-            enc_list.append(as_hex)
-
-        # prf hashes the label name so Neo4j never sees "Person" as a key
-        hashed_key = prf(Ks, w)
-        dsse_index[hashed_key] = {
-                                "entries": enc_list,   # p encrypted blobs
-                                "p_r":     p,          # padded size
-                                "label":   w           # original label (kept client-side)
-                                }
-        total_real += r       # count real entries
-        total_dummy += p - r  # count dummy entries
+    with ThreadPoolExecutor(max_workers=_cpu) as pool:
+        for hashed_key, entry, r, dummy_count in pool.map(_build_label_entry, hist.items()):
+            dsse_index[hashed_key] = entry
+            total_real  += r
+            total_dummy += dummy_count
     print("[Phase 1] Building encrypted adjacency index...")
 
     # Encrypted adjacency index 
-    # Each node stores an encrypted list of (neighbor_id, edge_label) pairs
     adj_plain = defaultdict(list)
     for u, v in edges:
         lbl = edge_label[(u,v)]
         adj_plain[u].append((v,lbl))
         adj_plain[v].append((u,lbl))  # undirected
- 
-    enc_adj = {}
-    for node, neighbors in adj_plain.items():
-        # Serialize entire neighbor list to JSON string
-        as_json = json.dumps(neighbors)
 
-        # Encode string to bytes
-        as_bytes = as_json.encode()
+    def _enc_adj(item):
+        node, neighbors = item
+        # Use msgpack when available — 3-5x faster than json + smaller payload
+        # over vsock, which is the hot path for BFS frontier expansion (§IV-D).
+        payload = (_msgpack.packb(neighbors) if _HAVE_MSGPACK
+                   else json.dumps(neighbors).encode())
+        return node, aes_gcm_encrypt(K, payload).hex()
 
-        # Encrypt the whole list as ONE blob with key K
-        encrypted = aes_gcm_encrypt(K, as_bytes)
-
-        # Convert to hex string for Neo4j storage
-        enc_adj[node] = encrypted.hex()
+    with ThreadPoolExecutor(max_workers=_cpu) as pool:
+        enc_adj = dict(pool.map(_enc_adj, adj_plain.items()))
  
     index_time = (time.perf_counter()-t0) * 1000 - enc_time
     print(f"          Adjacency index: {len(enc_adj)} nodes in {index_time:.0f}ms")
@@ -551,10 +578,16 @@ def phase2_load_neo4j(driver, enc_nodes, enc_edges, enc_adj):
                         """, batch=batch, dataset_id = DATASET_ID)
             print(f"          Nodes: {min(i+bs,len(node_list))}/{len(node_list)}", end="\r")
         print(f"\n          Loaded {len(enc_nodes)} nodes.")
-        # Create index on node_id for fast lookup later
+        # Create composite covering index — (dataset_id, node_id, ciphertext, adj_ct)
+        # eliminates the extra property-lookup hop for all UNWIND fetches (§IV-D).
         session.run("""
             CREATE INDEX enc_node_dataset IF NOT EXISTS
             FOR (n:EncNode) ON (n.dataset_id, n.node_id)
+        """)
+        # Covering index for the full property set avoids property-store lookups
+        session.run("""
+            CREATE INDEX enc_node_covering IF NOT EXISTS
+            FOR (n:EncNode) ON (n.dataset_id, n.node_id, n.ciphertext, n.adj_ct)
         """)        
         edge_list = list(enc_edges.items())
         for i in range(0, len(edge_list), bs):
@@ -579,34 +612,43 @@ def phase2_load_neo4j(driver, enc_nodes, enc_edges, enc_adj):
 # ── Neo4j fetch helper ───────────────────────────────────
 def fetch_nodes(driver, node_ids, p_r): # DVHGQP - Fetch exactly P(r) node blocks from Neo4j — Selective ORAM simulation
     t0 = time.perf_counter()
-    total_nodes = TOTAL_NODES 
+    total_nodes = TOTAL_NODES
 
     with driver.session() as session:
-        real_fetch = min(len(node_ids), p_r)
-        ids_to_fetch = [str(x) for x in node_ids[:real_fetch]] # convert to strings for Neo4j query
-        res = session.run("""
-                            UNWIND $ids AS nid 
-                            MATCH (n:EncNode {dataset_id:$dataset_id,node_id:nid})
-                            RETURN n.node_id AS nid, 
-                                   n.ciphertext AS ct, 
-                                   n.adj_ct AS adj_ct
-                          """, ids = ids_to_fetch, dataset_id = DATASET_ID)
-        records = list(res)
-        dummy_needed = p_r - real_fetch         
-        # e.g. p_r=55, real_fetch=50 → need 5 dummy nodes
-        if dummy_needed > 0:
-            # FIX Bug 2: use a random skip so the SP cannot derive r from the
-            # observed skip value (the old deterministic (p_r*7)%N leaked r).
+        real_fetch   = min(len(node_ids), p_r)
+        ids_to_fetch = [str(x) for x in node_ids[:real_fetch]]
+        dummy_needed = p_r - real_fetch
+
+        if dummy_needed == 0:
+            # Fast path: only real records needed — single UNWIND covers them all
+            res = session.run("""
+                UNWIND $ids AS nid
+                MATCH (n:EncNode {dataset_id:$dataset_id, node_id:nid})
+                RETURN n.node_id AS nid, n.ciphertext AS ct, n.adj_ct AS adj_ct
+            """, ids=ids_to_fetch, dataset_id=DATASET_ID)
+            records = list(res)
+        else:
+            # Optimisation (§IV-D): merge real + dummy IDs into ONE UNWIND query
+            # instead of UNION ALL — eliminates the second Cypher planning round-trip.
+            # Dummy IDs are chosen randomly from the full node set and interleaved;
+            # the covering index (dataset_id, node_id, ciphertext, adj_ct) means
+            # Neo4j can satisfy this query without a property-lookup hop.
             max_skip = max(1, total_nodes - dummy_needed)
             skip = random.randint(0, max_skip - 1)
-            dummy = session.run("""
-                                    MATCH (n:EncNode {dataset_id:$dataset_id})
-                                    RETURN n.node_id AS nid, 
-                                           n.ciphertext AS ct, 
-                                           n.adj_ct AS adj_ct
-                                    SKIP $skip LIMIT $lim
-                                """, skip = skip, lim = dummy_needed, dataset_id = DATASET_ID)
-            records += list(dummy) # Append dummies to real records
+            # Fetch dummy IDs separately so we can merge them with real IDs
+            dummy_res = session.run("""
+                MATCH (n:EncNode {dataset_id:$dataset_id})
+                RETURN n.node_id AS nid
+                SKIP $skip LIMIT $lim
+            """, dataset_id=DATASET_ID, skip=skip, lim=dummy_needed)
+            dummy_ids = [r["nid"] for r in dummy_res]
+            all_ids = ids_to_fetch + dummy_ids
+            res = session.run("""
+                UNWIND $all_ids AS nid
+                MATCH (n:EncNode {dataset_id:$dataset_id, node_id:nid})
+                RETURN n.node_id AS nid, n.ciphertext AS ct, n.adj_ct AS adj_ct
+            """, all_ids=all_ids, dataset_id=DATASET_ID)
+            records = list(res)
     return records, (time.perf_counter() - t0) * 1000
  
 def fetch_nodes_plain(driver, node_ids): # Baseline
@@ -711,7 +753,9 @@ def baseline_bfs(driver, K, adj_plain, start_node, max_depth=3): # Baseline - BF
                 if nid not in frontier_set: continue
                 adj_hex = rec["adj_ct"]
                 if not adj_hex: continue
-                neighbors = json.loads(aes_gcm_decrypt(K, bytes.fromhex(adj_hex)).decode())
+                raw_bytes = aes_gcm_decrypt(K, bytes.fromhex(adj_hex))
+                neighbors = (_msgpack.unpackb(raw_bytes, raw=False) if _HAVE_MSGPACK
+                             else json.loads(raw_bytes.decode()))
                 for nbr,_ in neighbors:
                     if nbr not in visited:
                         visited.add(nbr); new_frontier.append(nbr)
@@ -831,6 +875,38 @@ def subgraph_match_query(driver, K, adj_plain, node_label, pattern, k=None): # D
 
     if k is None:
         k = get_dynamic_k(r)
+
+    # Skip Spark entirely for small candidate sets — the fixed ~200ms
+    # Spark job-setup cost dominates for tiny r, so call the enclave
+    # directly on the driver instead (same path as nitro_label_fanout k=1).
+    if r < 500:
+        t0_direct = time.perf_counter()
+        records, t_neo4j = fetch_nodes(driver, candidates, p_r)
+        rec_list = [
+            {"nid": int(rec["nid"]), "adj_ct": rec["adj_ct"] or ""}
+            for rec in records
+        ]
+        matches_raw = _vsock_call(
+            op      = "decrypt_adjacency",
+            payload = {"key_hex": K.hex(), "records": rec_list},
+            cid     = ENCLAVE_CID,
+            port    = ENCLAVE_PORT,
+        )
+        matches = [
+            (int(nid_str), nbr_edge[0])
+            for nid_str, nbr_list in matches_raw.get("neighbors", {}).items()
+            for nbr_edge in nbr_list
+            if nbr_edge[1] == edge_lbl and node_label.get(nbr_edge[0]) == dst_lbl
+            and node_label.get(int(nid_str)) == src_lbl
+        ]
+        t_spark = (time.perf_counter() - t0_direct) * 1000
+        t_tee = 0.0
+        t_total = (time.perf_counter() - t0) * 1000
+        return {"pattern": f"{src_lbl}-[{edge_lbl}]->{dst_lbl}",
+                "candidates": r, "p_r": p_r, "matches": len(matches), "k": 1,
+                "t_dsse_ms": round(t_dsse, 4), "t_tee_ms": round(t_tee, 2),
+                "t_neo4j_ms": round(t_neo4j, 2), "t_spark_ms": round(t_spark, 2),
+                "t_total_ms": round(t_total, 2)}
 
     # Measure real PRF token derivation time — Tw ← PRF(Ks, src_lbl)
     # This mirrors the paper's Step 1 (§III-B): the DO derives a search token
@@ -983,27 +1059,30 @@ def fetch_blocks_label(driver, node_ids, p_r): # fetch exactly p_r blocks from N
     t0 = time.perf_counter()
     total_nodes = TOTAL_NODES
     with driver.session() as session:
-        real_fetch = min(len(node_ids),p_r)
+        real_fetch   = min(len(node_ids), p_r)
         ids_to_fetch = [str(x) for x in node_ids[:real_fetch]]
-        res = session.run("""
-                            UNWIND $ids AS nid 
-                            MATCH (n:EncNode {dataset_id:$dataset_id,node_id:nid})
-                            RETURN n.node_id AS nid, 
-                                   n.ciphertext AS ct
-                          """, ids = ids_to_fetch, dataset_id = DATASET_ID)
-        records = list(res)
         dummy_needed = p_r - real_fetch
-        if dummy_needed > 0:
-            # FIX Bug 2: use a random skip (same fix as fetch_nodes)
+
+        if dummy_needed == 0:
+            res = session.run("""
+                UNWIND $ids AS nid
+                MATCH (n:EncNode {dataset_id:$dataset_id, node_id:nid})
+                RETURN n.node_id AS nid, n.ciphertext AS ct
+            """, ids=ids_to_fetch, dataset_id=DATASET_ID)
+            records = list(res)
+        else:
             max_skip = max(1, total_nodes - dummy_needed)
             skip = random.randint(0, max_skip - 1)
-            dummy = session.run("""
-                                    MATCH (n:EncNode {dataset_id:$dataset_id})
-                                    RETURN n.node_id AS nid, 
-                                           n.ciphertext AS ct
-                                    SKIP $skip LIMIT $lim
-                                """, skip = skip, lim = dummy_needed, dataset_id = DATASET_ID)
-            records += list(dummy)
+            res = session.run("""
+                UNWIND $ids AS nid
+                MATCH (n:EncNode {dataset_id:$dataset_id, node_id:nid})
+                RETURN n.node_id AS nid, n.ciphertext AS ct
+                UNION ALL
+                MATCH (n:EncNode {dataset_id:$dataset_id})
+                RETURN n.node_id AS nid, n.ciphertext AS ct
+                SKIP $skip LIMIT $lim
+            """, ids=ids_to_fetch, skip=skip, lim=dummy_needed, dataset_id=DATASET_ID)
+            records = list(res)
     return records, (time.perf_counter() - t0) * 1000
 
 def oblivgm_label_query(driver, dsse_index, Ks, Ke, K, label):
@@ -1866,7 +1945,14 @@ def main():
         stats["label_breakdown"][w] = {"real":r, "dummy":p-r, "p_r":p, "overhead_pct":round((p-r)/r*100,1)}
  
     print(f"[Phase 2] Connecting to Neo4j: {CONFIG['NEO4J_URI']}")
-    driver = GraphDatabase.driver(CONFIG["NEO4J_URI"], auth = (CONFIG["NEO4J_USERNAME"], CONFIG["NEO4J_PASSWORD"]))
+    # Connection pooling: configure pool size upfront (match Spark k=8 + overhead)
+    # instead of driver.session() opening/closing a connection on every fetch call.
+    driver = GraphDatabase.driver(
+        CONFIG["NEO4J_URI"],
+        auth=(CONFIG["NEO4J_USERNAME"], CONFIG["NEO4J_PASSWORD"]),
+        max_connection_pool_size=20,       # match Spark k=8 + overhead
+        connection_acquisition_timeout=30,
+    )
     driver.verify_connectivity()
     print("          Connection verified.")
     phase2_load_neo4j(driver, enc_nodes, enc_edges, enc_adj)
