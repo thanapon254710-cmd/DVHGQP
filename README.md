@@ -49,7 +49,7 @@ Graph-structured data is increasingly used to model complex relationships in soc
   ┌─────────────────────────────────────────────────────────────┐
   │                      AWS EC2 Instance                       │
   │                                                             │
-  │  ┌─────────────────┐   encrypted      ┌─────────────────┐   │
+  │  ┌──────────────────┐   encrypted      ┌─────────────────┐  │
   │  │   Flask App      │ ───────────────► │  Neo4j (local)  │  │
   │  │  TeeDemo.py      │ ◄─────────────── │  Graph Store    │  │
   │  └────────┬─────────┘  ciphertext only └─────────────────┘  │
