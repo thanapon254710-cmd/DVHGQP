@@ -239,7 +239,7 @@ DVH-GQP is the only scheme simultaneously protecting data content, access patter
 ### Python Dependencies
 
 ```bash
-pip install flask pycryptodome python-dotenv neo4j pyspark==3.5.8 numpy pandas matplotlib
+pip3.8 install flask pycryptodome python-dotenv neo4j pyspark==3.5.8 numpy pandas matplotlib phe
 ```
 
 ---
