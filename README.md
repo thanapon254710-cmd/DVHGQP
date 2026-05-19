@@ -9,7 +9,6 @@ A privacy-preserving graph query system that encrypts graph data using **AES-256
 ## Table of Contents
 
 - [Overview](#overview)
-- [System Architecture](#system-architecture)
 - [Protocol](#protocol)
 - [Security Model](#security-model)
 - [Query Types](#query-types)
@@ -40,29 +39,6 @@ Graph-structured data is increasingly used to model complex relationships in soc
 - **AWS Nitro Enclave** provides hardware-isolated decryption — host OS cannot access plaintext
 - **Apache Spark** with dynamic executor scaling (k) distributes query execution across partitions
 - Experimental results show end-to-end query latency of **167–1,055 ms** on the SNAP Email-Enron dataset
-
----
-
-## System Architecture
-
-```
-  ┌─────────────────────────────────────────────────────────────┐
-  │                      AWS EC2 Instance                       │
-  │                                                             │
-  │  ┌──────────────────┐   encrypted      ┌─────────────────┐  │
-  │  │   Flask App      │ ───────────────► │  Neo4j (local)  │  │
-  │  │  TeeDemo.py      │ ◄─────────────── │  Graph Store    │  │
-  │  └────────┬─────────┘  ciphertext only └─────────────────┘  │
-  │           │ AF_VSOCK                                        │
-  │  ┌────────▼─────────┐   ┌─────────────────────────────────┐ │
-  │  │  Nitro Enclave   │   │      Apache Spark Cluster       │ │
-  │  │  (TEE)           │◄──│  k executor-enclave pairs       │ │
-  │  │  - AES decrypt   │   │  dynamic k based on workload r  │ │
-  │  │  - DSSE lookup   │   └─────────────────────────────────┘ │
-  │  │  - ORAM control  │                                       │
-  │  └──────────────────┘                                       │
-  └─────────────────────────────────────────────────────────────┘
-```
 
 ### Principal Entities
 
