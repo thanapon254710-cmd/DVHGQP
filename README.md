@@ -466,3 +466,7 @@ All datasets from [SNAP Stanford](https://snap.stanford.edu/data/). Format: spac
 - Neo4j stores **only ciphertext** — the `label` property visible in Neo4j Browser is an encrypted hex string, not the plaintext label
 - The enclave **does not auto-start** after EC2 stop/start unless the systemd service above is enabled
 - In a single-node deployment, increasing Spark `k` introduces scheduling overhead without proportional speedup. In a production EMR cluster with dedicated per-worker enclaves, higher `k` provides near-linear latency reduction — reported overhead should be interpreted as a conservative upper bound for real-world multi-node deployments
+
+## License
+
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
